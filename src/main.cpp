@@ -2,7 +2,6 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
-#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -24,10 +23,11 @@ using namespace mpi_comm;
 
 namespace {
 
-struct SocketOperationConfig {
-  MsgType type;
-  std::string name;
-  int port;
+struct DecodedSocketRequest {
+  uint32_t client_id = 0;
+  MsgType type = MsgType::GET_REQ;
+  std::string key;
+  std::string value;
 };
 
 bool has_flag(int argc, char** argv, const std::string& flag) {
@@ -58,6 +58,13 @@ int parse_int_arg(int argc, char** argv, const std::string& arg_name, int fallba
     }
   }
   return fallback;
+}
+
+int validate_port(int port, const std::string& arg_name) {
+  if (port < 1 || port > 65535) {
+    throw std::invalid_argument(arg_name + " must be between 1 and 65535");
+  }
+  return port;
 }
 
 uint64_t parse_snapshot_interval_seconds(int argc, char** argv) {
@@ -122,46 +129,10 @@ int open_listener(const std::string& bind_address, int port) {
   return fd;
 }
 
-std::string recv_line(int fd) {
-  std::string line;
-  char buffer[512];
-  while (true) {
-    const ssize_t n = recv(fd, buffer, sizeof(buffer), 0);
-    if (n < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      throw std::runtime_error("recv() failed: " + std::string(std::strerror(errno)));
-    }
-
-    if (n == 0) {
-      break;
-    }
-
-    line.append(buffer, buffer + n);
-    if (line.find('\n') != std::string::npos) {
-      break;
-    }
-
-    if (line.size() > 2048) {
-      throw std::runtime_error("request too large");
-    }
-  }
-
-  const size_t newline = line.find('\n');
-  if (newline != std::string::npos) {
-    line.resize(newline);
-  }
-  if (!line.empty() && line.back() == '\r') {
-    line.pop_back();
-  }
-  return line;
-}
-
-void send_text(int fd, const std::string& text) {
+void send_all(int fd, const char* data, size_t size) {
   size_t written = 0;
-  while (written < text.size()) {
-    const ssize_t n = send(fd, text.data() + written, text.size() - written, 0);
+  while (written < size) {
+    const ssize_t n = send(fd, data + written, size - written, MSG_NOSIGNAL);
     if (n < 0) {
       if (errno == EINTR) {
         continue;
@@ -170,6 +141,93 @@ void send_text(int fd, const std::string& text) {
     }
     written += static_cast<size_t>(n);
   }
+}
+
+void send_text(int fd, const std::string& text) {
+  send_all(fd, text.data(), text.size());
+}
+
+void recv_exact(int fd, char* buffer, size_t size) {
+  size_t received = 0;
+  while (received < size) {
+    const ssize_t n = recv(fd, buffer + received, size - received, 0);
+    if (n < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      throw std::runtime_error("recv() failed: " + std::string(std::strerror(errno)));
+    }
+    if (n == 0) {
+      throw std::runtime_error("client disconnected before request was fully received");
+    }
+    received += static_cast<size_t>(n);
+  }
+}
+
+std::vector<char> recv_framed_message(int fd) {
+  uint32_t frame_size_net = 0;
+  recv_exact(fd, reinterpret_cast<char*>(&frame_size_net), sizeof(frame_size_net));
+  const uint32_t frame_size = ntohl(frame_size_net);
+  if (frame_size < 9 || frame_size > 64 * 1024) {
+    throw std::runtime_error("invalid frame size");
+  }
+
+  std::vector<char> body(frame_size);
+  recv_exact(fd, body.data(), body.size());
+  return body;
+}
+
+DecodedSocketRequest decode_socket_request(const std::vector<char>& body) {
+  if (body.size() < 9) {
+    throw std::runtime_error("request body too small");
+  }
+
+  size_t offset = 0;
+  const auto read_u32 = [&](size_t at) -> uint32_t {
+    uint32_t value = 0;
+    std::memcpy(&value, body.data() + at, sizeof(value));
+    return ntohl(value);
+  };
+  const auto read_u16 = [&](size_t at) -> uint16_t {
+    uint16_t value = 0;
+    std::memcpy(&value, body.data() + at, sizeof(value));
+    return ntohs(value);
+  };
+
+  DecodedSocketRequest request;
+  request.client_id = read_u32(offset);
+  offset += sizeof(uint32_t);
+
+  const uint8_t op = static_cast<uint8_t>(body[offset++]);
+  if (op == 1) {
+    request.type = MsgType::PUT_REQ;
+  } else if (op == 2) {
+    request.type = MsgType::GET_REQ;
+  } else if (op == 3) {
+    request.type = MsgType::DEL_REQ;
+  } else {
+    throw std::runtime_error("invalid op in request");
+  }
+
+  const uint16_t key_size = read_u16(offset);
+  offset += sizeof(uint16_t);
+  const uint16_t value_size = read_u16(offset);
+  offset += sizeof(uint16_t);
+
+  const size_t expected_size = offset + static_cast<size_t>(key_size) + static_cast<size_t>(value_size);
+  if (body.size() != expected_size) {
+    throw std::runtime_error("request body length mismatch");
+  }
+
+  request.key.assign(body.data() + offset, body.data() + offset + key_size);
+  offset += key_size;
+  request.value.assign(body.data() + offset, body.data() + offset + value_size);
+
+  if (request.type != MsgType::PUT_REQ && !request.value.empty()) {
+    throw std::runtime_error("value is only allowed for PUT");
+  }
+
+  return request;
 }
 
 Message make_operation_request(MsgType type,
@@ -190,33 +248,21 @@ Message make_operation_request(MsgType type,
 }
 
 bool handle_socket_request(int client_fd,
-                           const SocketOperationConfig& operation,
                            int world_size,
                            int request_id,
                            bool verbose) {
-  const std::string payload = recv_line(client_fd);
-
-  std::string key;
-  std::string value;
-
-  if (operation.type == MsgType::PUT_REQ) {
-    const size_t delimiter = payload.find('\t');
-    if (delimiter == std::string::npos) {
-      send_text(client_fd, "status=INVALID error=expected_key_tab_value\\n");
-      return true;
-    }
-    key = payload.substr(0, delimiter);
-    value = payload.substr(delimiter + 1);
-  } else {
-    key = payload;
-  }
+  const DecodedSocketRequest request = decode_socket_request(recv_framed_message(client_fd));
+  const std::string& key = request.key;
+  const std::string& value = request.value;
+  const MsgType op_type = request.type;
+  const char* op_name = (op_type == MsgType::PUT_REQ) ? "PUT" : (op_type == MsgType::GET_REQ ? "GET" : "DEL");
 
   if (key.empty()) {
     send_text(client_fd, "status=INVALID error=empty_key\\n");
     return true;
   }
 
-  if (operation.type == MsgType::DEL_REQ && key == "__shutdown__") {
+  if (op_type == MsgType::DEL_REQ && key == "__shutdown__") {
     for (int rank = 1; rank < world_size; ++rank) {
       send_msg(rank, make_shutdown());
     }
@@ -231,7 +277,7 @@ bool handle_socket_request(int client_fd,
   }
 
   const Message req =
-      make_operation_request(operation.type, request_id, std::string_view(key), std::string_view(value), primary_rank);
+      make_operation_request(op_type, request_id, std::string_view(key), std::string_view(value), primary_rank);
   send_msg(primary_rank, req);
 
   Message resp{};
@@ -241,13 +287,14 @@ bool handle_socket_request(int client_fd,
       "status=" + std::to_string(static_cast<int>(resp.status)) +
       " request_id=" + std::to_string(resp.request_id) +
       " version=" + std::to_string(resp.version);
-  if (resp.status == Status::OK && operation.type == MsgType::GET_REQ) {
+  if (resp.status == Status::OK && op_type == MsgType::GET_REQ) {
     response += " value=" + std::string(value_view(resp));
   }
   response += "\\n";
 
   if (verbose) {
-    std::cout << "[Gateway] op=" << operation.name
+    std::cout << "[Gateway] client_id=" << request.client_id
+              << " op=" << op_name
               << " key=" << key
               << " primary_rank=" << primary_rank
               << " request_id=" << request_id
@@ -260,76 +307,38 @@ bool handle_socket_request(int client_fd,
 
 void run_socket_gateway(int argc, char** argv, int world_size, bool verbose) {
   const std::string bind_address = parse_string_arg(argc, argv, "--bind-address", "0.0.0.0");
-
-  std::vector<SocketOperationConfig> operations{
-      {MsgType::PUT_REQ, "PUT", parse_int_arg(argc, argv, "--put-port", 7101)},
-      {MsgType::GET_REQ, "GET", parse_int_arg(argc, argv, "--get-port", 7102)},
-      {MsgType::DEL_REQ, "DEL", parse_int_arg(argc, argv, "--del-port", 7103)},
-  };
-
-  std::vector<int> listeners;
-  listeners.reserve(operations.size());
-  std::vector<pollfd> poll_fds;
-  poll_fds.reserve(operations.size());
+  const int gateway_port = validate_port(parse_int_arg(argc, argv, "--gateway-port", 7100), "--gateway-port");
 
   try {
-    for (const SocketOperationConfig& operation : operations) {
-      const int listener_fd = open_listener(bind_address, operation.port);
-      listeners.push_back(listener_fd);
-      poll_fds.push_back(pollfd{listener_fd, POLLIN, 0});
-      if (verbose) {
-        std::cout << "[Gateway] Listening for " << operation.name
-                  << " on " << bind_address << ":" << operation.port << "\n";
-      }
+    const int listener_fd = open_listener(bind_address, gateway_port);
+    if (verbose) {
+      std::cout << "[Gateway] Listening on " << bind_address << ":" << gateway_port
+                << " (framed binary protocol)\n";
     }
 
     int next_request_id = 1;
     bool running = true;
     while (running) {
-      const int ready = poll(poll_fds.data(), poll_fds.size(), -1);
-      if (ready < 0) {
+      sockaddr_in client_addr{};
+      socklen_t client_len = sizeof(client_addr);
+      const int client_fd = accept(listener_fd, reinterpret_cast<sockaddr*>(&client_addr), &client_len);
+      if (client_fd < 0) {
         if (errno == EINTR) {
           continue;
         }
-        throw std::runtime_error("poll() failed: " + std::string(std::strerror(errno)));
+        throw std::runtime_error("accept() failed: " + std::string(std::strerror(errno)));
       }
 
-      for (size_t i = 0; i < poll_fds.size(); ++i) {
-        if ((poll_fds[i].revents & POLLIN) == 0) {
-          continue;
-        }
-
-        sockaddr_in client_addr{};
-        socklen_t client_len = sizeof(client_addr);
-        const int client_fd = accept(poll_fds[i].fd, reinterpret_cast<sockaddr*>(&client_addr), &client_len);
-        if (client_fd < 0) {
-          if (errno == EINTR) {
-            continue;
-          }
-          throw std::runtime_error("accept() failed: " + std::string(std::strerror(errno)));
-        }
-
-        try {
-          running = handle_socket_request(client_fd, operations[i], world_size, next_request_id++, verbose);
-        } catch (const std::exception& ex) {
-          send_text(client_fd, std::string("status=ERROR error=") + ex.what() + "\n");
-        }
-        close(client_fd);
-
-        if (!running) {
-          break;
-        }
+      try {
+        running = handle_socket_request(client_fd, world_size, next_request_id++, verbose);
+      } catch (const std::exception& ex) {
+        send_text(client_fd, std::string("status=ERROR error=") + ex.what() + "\n");
       }
+      close(client_fd);
     }
+    close(listener_fd);
   } catch (...) {
-    for (const int fd : listeners) {
-      close(fd);
-    }
     throw;
-  }
-
-  for (const int fd : listeners) {
-    close(fd);
   }
 }
 
