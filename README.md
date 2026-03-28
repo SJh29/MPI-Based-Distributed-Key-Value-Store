@@ -74,9 +74,8 @@ Status codes follow `Status` enum in `src/common/protocol.h`:
 
 ## Example usage
 
-```bash
+```python
 # Python example client for PUT/GET/DEL over framed binary protocol
-python3 - <<'PY'
 import socket
 import struct
 
@@ -105,5 +104,4 @@ send_req(client_id=1002, op=2, key=b"hello")
 send_req(client_id=1003, op=3, key=b"hello")
 # Graceful shutdown
 send_req(client_id=9999, op=3, key=b"__shutdown__")
-PY
 ```
